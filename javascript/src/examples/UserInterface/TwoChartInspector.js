@@ -2,13 +2,13 @@
 // time-series of NDVI and reflectance for each click on the map.
 
 // Filter collection to dates of interest.
-var l8 = ee.ImageCollection('LANDSAT/LC8_L1T_TOA')
-    .filterDate('2014-06-01', '2015-06-01')
+var l8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA')
+    .filterDate('2016-06-01', '2017-06-01');
 
 // Create two collections to sample from, one for each plot.
 var rgb = l8.select(['B4', 'B3', 'B2']);
 var ndvi = l8.map(function(image) {
-  return image.select().addBands(image.normalizedDifference(["B5", "B4"]));
+  return image.select().addBands(image.normalizedDifference(['B5', 'B4']));
 });
 
 var vis = {min: 0, max: 1, palette: [

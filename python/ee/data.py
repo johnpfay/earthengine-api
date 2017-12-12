@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Singleton for all of the library's communcation with the Earth Engine API."""
+"""Singleton for the library's communication with the Earth Engine API."""
 
 from __future__ import print_function
 
@@ -11,6 +11,9 @@ from __future__ import print_function
 # pylint: disable=g-bad-import-order
 import contextlib
 import json
+import threading
+import time
+
 import httplib2
 import six
 
@@ -42,30 +45,50 @@ _initialized = False
 # it timed out. 0 means no limit.
 _deadline_ms = 0
 
-# A function called when profile results are received from the server. Takes the
-# profile ID as an argument. None if profiling is disabled.
-#
-# This is a global variable because the alternative is to add a parameter to
-# ee.data.send_, which would then have to be propagated from the assorted API
-# call functions (ee.data.getInfo, ee.data.getMapId, etc.), and the user would
-# have to modify each call to profile, rather than enabling profiling as a
-# wrapper around the entire program (with ee.data.profiling, defined below).
-_profile_hook = None
 
+class _ThreadLocals(threading.local):
+
+  def __init__(self):
+    # pylint: disable=super-init-not-called
+
+    # A function called when profile results are received from the server. Takes
+    # the profile ID as an argument. None if profiling is disabled.
+    #
+    # This is a thread-local variable because the alternative is to add a
+    # parameter to ee.data.send_, which would then have to be propagated from
+    # the assorted API call functions (ee.data.getInfo, ee.data.getMapId, etc.),
+    # and the user would have to modify each call to profile, rather than
+    # enabling profiling as a wrapper around the entire program (with
+    # ee.data.profiling, defined below).
+    self.profile_hook = None
+
+_thread_locals = _ThreadLocals()
 
 # The HTTP header through which profile results are returned.
 # Lowercase because that's how httplib2 does things.
 _PROFILE_HEADER_LOWERCASE = 'x-earth-engine-computation-profile'
 
+# Maximum number of times to retry a rate-limited request.
+MAX_RETRIES = 5
+
+# Maximum time to wait before retrying a rate-limited request (in milliseconds).
+MAX_RETRY_WAIT = 120000
+
+# Base time (in ms) to wait when performing exponential backoff in request
+# retries.
+BASE_RETRY_WAIT = 1000
+
 # The default base URL for API calls.
 DEFAULT_API_BASE_URL = 'https://earthengine.googleapis.com/api'
 
 # The default base URL for media/tile calls.
-DEFAULT_TILE_BASE_URL = 'https://earthengine.googleapis.com/'
+DEFAULT_TILE_BASE_URL = 'https://earthengine.googleapis.com'
 
 # Asset types recognized by create_assets().
 ASSET_TYPE_FOLDER = 'Folder'
 ASSET_TYPE_IMAGE_COLL = 'ImageCollection'
+# Max length of the above type names
+MAX_TYPE_LENGTH = len(ASSET_TYPE_IMAGE_COLL)
 
 
 def initialize(credentials=None, api_base_url=None, tile_base_url=None):
@@ -132,13 +155,12 @@ def profiling(hook):
     hook: A function of one argument which is called with each profile
         ID obtained from API calls, just before the API call returns.
   """
-  global _profile_hook
-  saved_hook = _profile_hook
-  _profile_hook = hook
+  saved_hook = _thread_locals.profile_hook
+  _thread_locals.profile_hook = hook
   try:
     yield
   finally:
-    _profile_hook = saved_hook
+    _thread_locals.profile_hook = saved_hook
 
 
 
@@ -398,7 +420,7 @@ def getAlgorithms():
   return send_('/algorithms', {}, 'GET')
 
 
-def createAsset(value, opt_path=None):
+def createAsset(value, opt_path=None, opt_force=False, opt_properties=None):
   """Creates an asset from a JSON value.
 
   To create an empty image collection or folder, pass in a "value" object
@@ -408,6 +430,9 @@ def createAsset(value, opt_path=None):
     value: An object describing the asset to create or a JSON string
         with the already-serialized value for the new asset.
     opt_path: An optional desired ID, including full path.
+    opt_force: True if asset overwrite is allowed
+    opt_properties: The keys and values of the properties to set
+        on the created asset.
 
   Returns:
     A description of the saved asset, including a generated ID.
@@ -417,6 +442,9 @@ def createAsset(value, opt_path=None):
   args = {'value': value, 'json_format': 'v2'}
   if opt_path is not None:
     args['id'] = opt_path
+  args['force'] = opt_force
+  if opt_properties is not None:
+    args['properties'] = json.dumps(opt_properties)
   return send_('/create', args)
 
 
@@ -524,8 +552,8 @@ def startProcessing(taskId, params):
   return send_('/processingrequest', args)
 
 
-def startIngestion(taskId, params):
-  """Creates an asset import task.
+def startIngestion(taskId, params, allow_overwrite=False):
+  """Creates an image asset import task.
 
   Args:
     taskId: ID for the task (obtained using newTaskId).
@@ -542,16 +570,45 @@ def startIngestion(taskId, params):
             object names, e.g. 'gs://bucketname/filename.tif'
           bands (array) An optional list of band names formatted like:
             [{'id': 'R'}, {'id': 'G'}, {'id': 'B'}]
-          extensions (array) An optional list of file extensions formatted like:
-            ['tif', 'prj']. Useful if the file names in GCS lack extensions.
+    allow_overwrite: Whether the ingested image can overwrite an
+        existing version.
 
   Returns:
     A dict with optional notes about the created task.
   """
-  args = {'id': taskId, 'request': json.dumps(params)}
+  args = {
+      'id': taskId,
+      'request': json.dumps(params),
+      'allowOverwrite': allow_overwrite
+  }
   return send_('/ingestionrequest', args)
 
 
+def startTableIngestion(taskId, params, allow_overwrite=False):
+  """Creates a table asset import task.
+
+  Args:
+    taskId: ID for the task (obtained using newTaskId).
+    params: The object that describes the import task, which can
+        have these fields:
+          id (string) The destination asset id (e.g. users/foo/bar).
+          sources (array) A list of CNS source file paths with optional
+            character encoding formatted like:
+            "sources": [{ "primaryPath": "states.shp", "charset": "UTF-8" }]
+            Where path values correspond to source files' CNS locations,
+            e.g. 'googlefile://namespace/foobar.shp', and 'charset' refers to
+            the character encoding of the source file.
+    allow_overwrite: Whether the ingested image can overwrite an
+        existing version.
+  Returns:
+    A dict with optional notes about the created task.
+  """
+  args = {
+      'id': taskId,
+      'tableRequest': json.dumps(params),
+      'allowOverwrite': allow_overwrite
+  }
+  return send_('/ingestionrequest', args)
 
 
 def getAssetRoots():
@@ -675,7 +732,7 @@ def send_(path, params, opt_method='POST', opt_raw=False):
   # Make sure we never perform API calls before initialization.
   initialize()
 
-  if _profile_hook:
+  if _thread_locals.profile_hook:
     params = params.copy()
     params['profiling'] = '1'
 
@@ -698,17 +755,39 @@ def send_(path, params, opt_method='POST', opt_raw=False):
   else:
     raise ee_exception.EEException('Unexpected request method: ' + opt_method)
 
-  try:
-    response, content = http.request(url, method=opt_method, body=payload,
-                                     headers=headers)
-  except httplib2.HttpLib2Error as e:
-    raise ee_exception.EEException(
-        'Unexpected HTTP error: %s' % e.message)
+  def send_with_backoff(retries=0):
+    """Send an API call with backoff.
+
+    Attempts an API call. If the server's response has a 429 status, retry the
+    request using an incremental backoff strategy.
+
+    Args:
+      retries: The number of retries that have already occurred.
+
+    Returns:
+      A tuple of response, content returned by the API call.
+
+    Raises:
+      EEException: For errors from the server.
+    """
+    try:
+      response, content = http.request(url, method=opt_method, body=payload,
+                                       headers=headers)
+      if response.status == 429:
+        if retries < MAX_RETRIES:
+          time.sleep(min(2 ** retries * BASE_RETRY_WAIT, MAX_RETRY_WAIT) / 1000)
+          response, content = send_with_backoff(retries + 1)
+    except httplib2.HttpLib2Error as e:
+      raise ee_exception.EEException(
+          'Unexpected HTTP error: %s' % e.message)
+    return response, content
+
+  response, content = send_with_backoff()
 
   # Call the profile hook if present. Note that this is done before we handle
   # the content, so that profiles are reported even if the response is an error.
-  if _profile_hook and _PROFILE_HEADER_LOWERCASE in response:
-    _profile_hook(response[_PROFILE_HEADER_LOWERCASE])
+  if _thread_locals.profile_hook and _PROFILE_HEADER_LOWERCASE in response:
+    _thread_locals.profile_hook(response[_PROFILE_HEADER_LOWERCASE])
 
   # Whether or not the response is an error, it may be JSON.
   content_type = (response['content-type'] or 'application/json').split(';')[0]
@@ -724,7 +803,7 @@ def send_(path, params, opt_method='POST', opt_raw=False):
         # Python 2.x
         content = content
       json_content = json.loads(content)
-    except Exception as e:
+    except Exception:
       raise ee_exception.EEException('Invalid JSON: %s' % content)
     if 'error' in json_content:
       raise ee_exception.EEException(json_content['error']['message'])

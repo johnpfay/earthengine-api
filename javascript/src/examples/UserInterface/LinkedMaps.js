@@ -1,9 +1,11 @@
 // Display a grid of linked maps, each with a different visualization.
 
-var image = ee.Image('LANDSAT/LC8_L1T_ANNUAL_TOA/2013');
+var image = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA')
+    .filterDate('2013-01-01', '2013-12-31')
+    .median();
 
 var NAMES = [
-  'Natural color (B4/B3/B2)',
+  'Natural Color (B4/B3/B2)',
   'Shortwave IR (B7/B5/B4)',
   'Color Infrared (B5/B4/B3)',
   'Agriculture (B6/B5/B2)'
@@ -35,7 +37,7 @@ maps[0].setControlVisibility({zoomControl: true});
 maps[3].setControlVisibility({scaleControl: true});
 
 // Create a title.
-var title = ui.Label('2013 Landat 8 TOA Visualizations', {
+var title = ui.Label('2013 Landsat 8 TOA Visualizations', {
   stretch: 'horizontal',
   textAlign: 'center',
   fontWeight: 'bold',
@@ -43,7 +45,8 @@ var title = ui.Label('2013 Landat 8 TOA Visualizations', {
 });
 
 // Create a grid of maps.
-var mapGrid = ui.Panel([
+var mapGrid = ui.Panel(
+  [
     ui.Panel([maps[0], maps[1]], null, {stretch: 'both'}),
     ui.Panel([maps[2], maps[3]], null, {stretch: 'both'})
   ],
